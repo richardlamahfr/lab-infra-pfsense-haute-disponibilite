@@ -351,7 +351,8 @@ Le plan suivant transforme l’architecture en critères de recette observables.
 | NET 03 | Sortie Internet interdite | Depuis une adresse 192.168.99.110 à .120, tester une destination Internet | Accès bloqué | Réussi, capture à ajouter |
 | NET 04 | Réseau interne | Depuis une adresse de la plage réservée, joindre une ressource LAN autorisée | Communication interne fonctionnelle | Réussi, capture à ajouter |
 | HA 01 | Reprise par le nœud de secours | pfSense 1 arrêté, seul pfSense 2 en service | La VIP 192.168.99.100 reste disponible | Réussi : pfSense 2 assure seul la sortie Internet (ping 8.8.8.8 sans perte, 28 à 39 ms) |
-| HA 01b | Bascule à chaud | Ping continu depuis un poste, puis arrêt de pfSense 1 en cours de trafic | Nombre de paquets perdus mesuré | À réaliser |
+| HA 01b | Bascule à chaud | Ping continu depuis un poste, puis arrêt brutal de pfSense 1 en cours de trafic | Nombre de paquets perdus mesuré | Réussi : environ 3 s de coupure (3 paquets perdus sous Linux, 1 délai d’attente sous Windows) |
+| HA 03 | Double panne | Arrêt des deux pfSense pendant un ping continu, puis redémarrage d’un nœud | Coupure totale, reprise dès qu’un nœud revient | Conforme |
 | HA 02 | Retour du nœud | Redémarrer le nœud initial et vérifier la synchronisation | Aucune perte durable de configuration | À réaliser |
 | AD 01 | DNS interne | Résoudre le domaine depuis un poste Windows | Réponse DNS depuis 192.168.99.15 | Capture à ajouter |
 | AD 02 | Domaine | Ouvrir une session avec un compte du domaine | Authentification fonctionnelle | Capture à ajouter |
@@ -379,7 +380,27 @@ Les machines du LAN, qui utilisent toujours la passerelle 192.168.99.100, retrou
 
 ![Windows Server 2019 : navigation web via pfSense 2](images/tests/05-windows-server-internet-via-pfsense2.png)
 
-**Conclusion.** Le nœud de secours prend en charge la passerelle virtuelle et la sortie Internet sans modification sur les postes. La prochaine étape est la bascule à chaud (HA 01b), qui permettra de mesurer la durée réelle de coupure.
+**Conclusion.** Le nœud de secours prend en charge la passerelle virtuelle et la sortie Internet sans modification sur les postes. La bascule à chaud est détaillée en 11.2.
+
+## 11.2 Bascule à chaud du 16 octobre 2026
+
+**Méthode.** Les deux pfSense sont en service. Un ping continu vers 8.8.8.8 est lancé depuis Ubuntu Client (192.168.99.8) et depuis le poste Windows Direction. pfSense 1 est ensuite arrêté brutalement (Power Off dans VMware) pendant que le trafic passe.
+
+![Ping continu, les deux pfSense en service](images/tests/06-bascule-avant-deux-pfsense-actifs.png)
+
+**Résultat sous Linux.** La réponse icmp_seq=54 met 452 ms, puis la suivante affichée est icmp_seq=58 : les requêtes 55, 56 et 57 sont restées sans réponse. Sous Linux, ping n’affiche pas les paquets perdus, il faut les repérer aux numéros de séquence manquants. Avec un ping par seconde, la coupure est donc d’environ 3 secondes. Le trafic repart ensuite normalement par pfSense 2.
+
+![Bascule : trou dans les numéros de séquence entre 54 et 58](images/tests/07-bascule-arret-pfsense1-ubuntu.png)
+
+**Résultat sous Windows.** Un seul « Request timed out » apparaît pendant la bascule, puis les réponses reprennent.
+
+![Ping continu depuis le poste Windows Direction](images/tests/09-windows-ping-continu.png)
+
+**Double panne (HA 03).** Quand pfSense 2 est arrêté à son tour, plus aucune réponse ne revient, puis le poste signale « Destination Host Unreachable » : plus personne ne porte la passerelle 192.168.99.100. Le trafic reprend dès qu’un des deux nœuds redémarre.
+
+![Double panne : plus de passerelle disponible](images/tests/08-double-panne-ubuntu.png)
+
+**Conclusion.** La bascule entre les deux pare-feu coûte environ 3 secondes de coupure, sans aucune action sur les postes. La redondance protège contre la perte d’un nœud, pas contre la perte des deux.
 
 # 12. Continuité, sauvegarde et restauration
 

@@ -6,7 +6,7 @@ Infrastructure de production simulée de 11 machines virtuelles sous VMware Work
 
 ## Compétences mises en œuvre
 
-- **Réseau et sécurité** : deux pfSense 2.7.2 en haute disponibilité (passerelle virtuelle 192.168.99.100, synchronisation sur un réseau dédié), NAT, filtrage de la sortie Internet par plage d'adresses
+- **Réseau et sécurité** : deux pfSense 2.7.2 en haute disponibilité (passerelle virtuelle 192.168.99.100, synchronisation sur un réseau dédié, bascule mesurée à environ 3 secondes), NAT, filtrage de la sortie Internet par plage d'adresses
 - **Windows Server** : contrôleur de domaine Active Directory et DNS (Windows Server 2019), quatre postes Windows 10 joints au domaine
 - **Linux** : Debian 13 et Ubuntu Server 24.04, pile web Nginx, MariaDB et WordPress
 - **Supervision** : Zabbix Server avec base MariaDB, agents Zabbix sur les serveurs Linux
@@ -40,7 +40,8 @@ Infrastructure de production simulée de 11 machines virtuelles sous VMware Work
 | HA 01 | pfSense 1 arrêté, pfSense 2 seul | La passerelle 192.168.99.100 reste disponible | **Réussi** : ping 8.8.8.8 sans perte (28 à 39 ms), navigation web depuis Windows Server |
 | NET 02 | Sortie Internet depuis le LAN | Accès fonctionnel | **Réussi** |
 | NET 03 | Sortie Internet depuis 192.168.99.110 à .120 | Bloquée, LAN joignable | **Réussi** |
-| HA 01b | Bascule à chaud pendant un ping continu | Coupure mesurée | À réaliser |
+| HA 01b | Arrêt brutal de pfSense 1 pendant un ping continu | Coupure mesurée | **Réussi : environ 3 s** (3 paquets perdus sous Linux, 1 délai d'attente sous Windows) |
+| HA 03 | Arrêt des deux pfSense | Coupure totale, reprise dès qu'un nœud revient | **Conforme** |
 | HA 02 | Retour du nœud initial | Configuration synchronisée | À réaliser |
 
 **Sans pare-feu, aucune sortie :**
@@ -52,6 +53,10 @@ Infrastructure de production simulée de 11 machines virtuelles sous VMware Work
 ![Console pfSense 2](docs/images/tests/01-console-pfsense2-interfaces.png)
 
 ![Ubuntu via pfSense 2](docs/images/tests/04-ubuntu-ping-via-pfsense2.png)
+
+**Bascule à chaud : pfSense 1 arrêté en plein trafic.** Les requêtes 55, 56 et 57 n'ont pas de réponse (sous Linux, ping n'affiche pas les pertes, elles se lisent dans les numéros manquants), puis le trafic repart par pfSense 2 :
+
+![Bascule à chaud](docs/images/tests/07-bascule-arret-pfsense1-ubuntu.png)
 
 Détail de la campagne et captures complémentaires : section 11 du [dossier d'architecture](docs/dossier-architecture.md#11-plan-de-validation).
 
@@ -87,7 +92,7 @@ Détail de la campagne et captures complémentaires : section 11 du [dossier d'a
 
 ## Évolutions prévues
 
-- Bascule à chaud avec mesure du temps de coupure, puis test du retour du nœud initial
+- Test du retour du nœud initial (HA 02) et réduction du temps de bascule
 - Segmentation en VLAN (serveurs, utilisateurs, administration, DMZ pour le serveur web)
 - Second contrôleur de domaine et DNS
 - Sauvegarde des VM et des configurations, avec test de restauration (RPO et RTO mesurés)
