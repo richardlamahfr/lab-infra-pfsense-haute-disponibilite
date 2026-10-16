@@ -6,7 +6,7 @@ Infrastructure de production simulée de 11 machines virtuelles sous VMware Work
 
 ## Compétences mises en œuvre
 
-- **Réseau et sécurité** : deux pfSense 2.7.2 en haute disponibilité CARP (VIP LAN 192.168.99.100 et VIP WAN 192.168.112.99, synchronisation sur un réseau dédié, bascule mesurée à environ 3 secondes, sessions TCP conservées grâce à pfsync), NAT, filtrage de la sortie Internet par plage d'adresses
+- **Réseau et sécurité** : deux pfSense 2.7.2 en haute disponibilité CARP (VIP LAN 192.168.99.100 et VIP WAN 192.168.112.99, synchronisation sur un réseau dédié, bascule mesurée à environ 3 secondes, sessions TCP conservées grâce à pfsync), NAT sortante sur la VIP WAN, filtrage de la sortie Internet par plage d'adresses
 - **Windows Server** : contrôleur de domaine Active Directory et DNS (Windows Server 2019), quatre postes Windows 10 joints au domaine
 - **Linux** : Debian 13 et Ubuntu Server 24.04, pile web Nginx, MariaDB et WordPress
 - **Supervision** : Zabbix Server avec base MariaDB, agents Zabbix sur les serveurs Linux
@@ -70,7 +70,7 @@ Infrastructure de production simulée de 11 machines virtuelles sous VMware Work
 
 ![curl continue après l'arrêt de pfSense 1](docs/images/tests/23-curl-apres-arret-pfsense1.png)
 
-Détail de la campagne et captures complémentaires : sections 11 à 11.5 du [dossier d'architecture](docs/dossier-architecture.md#11-plan-de-validation).
+Détail de la campagne et captures complémentaires : sections 11 à 11.6 du [dossier d'architecture](docs/dossier-architecture.md#11-plan-de-validation).
 
 ## Problèmes rencontrés et solutions
 
@@ -129,6 +129,20 @@ Détail de la campagne et captures complémentaires : sections 11 à 11.5 du [do
 ![pfsync fonctionnel sur pfSense 1](docs/images/tests/20-pfsync-ok-pfsense1.png)
 
 **Ce que j'en retiens** : quand CARP bascule correctement, cela ne prouve pas que pfsync fonctionne ; les deux se vérifient séparément.
+
+### 6. Les connexions n'auraient pas survécu à une bascule : NAT sortante sur l'adresse d'interface
+
+**Symptôme** : même avec pfsync fonctionnel, une connexion TCP en cours risquait d'être coupée lors d'une bascule.
+
+**Cause** : la règle de NAT sortante traduisait vers « WAN address », l'adresse propre de chaque nœud (192.168.112.138 sur pfSense 1, 192.168.112.139 sur pfSense 2). À la bascule, l'adresse de sortie changeait : pour le serveur distant, une autre machine reprenait la conversation, et il ne la reconnaissait pas.
+
+**Résolution** : mode Hybrid Outbound NAT et règle traduisant les sous-réseaux LAN vers la VIP WAN **192.168.112.99**, commune aux deux nœuds.
+
+**Résultat** : un téléchargement en cours continue sans interruption quand pfSense 1 s'arrête (test HA 05).
+
+![NAT sortante vers la VIP WAN](docs/images/tests/26-nat-sortante-apres-vip-wan.png)
+
+**Ce que j'en retiens** : une haute disponibilité complète repose sur trois briques distinctes : CARP pour l'adresse, pfsync pour les états, une NAT sortante sur la VIP pour l'adresse de sortie.
 
 ## Évolutions prévues
 

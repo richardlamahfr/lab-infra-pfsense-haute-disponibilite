@@ -4,7 +4,7 @@
 
 | **Référence** | ARC INFRA 001                                                     |
 |---------------|-------------------------------------------------------------------|
-| **Version**   | 1.5                                                               |
+| **Version**   | 1.6                                                               |
 | **Statut**    | Référence technique                                               |
 | **Date**      | Octobre 2026                                                      |
 | **Auteur**    | Richard Lamah                                                     |
@@ -279,6 +279,10 @@ La sortie Internet est contrôlée par la paire pfSense. Les règles appliquées
 | pfSense vers réseau WAN          | 192.168.112.0/24 et passerelle | Requis pour la sortie         | Non applicable             |
 | VMnet15                          | pfSense 1 et pfSense 2         | Aucune sortie attendue        | Synchronisation uniquement |
 
+## 8.1.1 NAT sortante
+
+Mode Hybrid Outbound NAT. Une règle manuelle traduit les sous-réseaux LAN (« LAN subnets ») vers la VIP CARP WAN 192.168.112.99 sur l’interface WAN. Toute la paire sort ainsi sous une adresse unique, quel que soit le nœud actif, ce qui permet aux connexions en cours de survivre à une bascule.
+
 ## 8.2 Position de Kali Linux
 
 Kali Linux est raccordé au LAN interne et porte l’adresse 192.168.99.25. Il est utilisé comme poste d’évaluation de la surface d’exposition interne, de la segmentation logique et des règles de filtrage. Son usage doit rester limité aux tests autorisés sur les équipements de l’environnement.
@@ -479,6 +483,14 @@ Le compteur de temps est continu : c’est la même connexion du début à la fi
 
 ![curl continue sur pfSense 2](images/tests/24-curl-continue-sur-pfsense2.png)
 
+## 11.6 Correction de la NAT sortante
+
+Avant correction, la règle de NAT sortante traduisait vers « WAN address », c’est-à-dire l’adresse propre de chaque nœud (192.168.112.138 ou 192.168.112.139). Lors d’une bascule, l’adresse de sortie changeait et les connexions en cours étaient perdues pour le serveur distant, même avec pfsync. La règle traduit désormais vers la VIP WAN 192.168.112.99, partagée par les deux nœuds : c’est cette correction, avec pfsync, qui rend le test HA 05 possible.
+
+![NAT sortante avant : WAN address](images/tests/25-nat-sortante-avant-wan-address.png)
+
+![NAT sortante après : VIP WAN 192.168.112.99](images/tests/26-nat-sortante-apres-vip-wan.png)
+
 # 12. Continuité, sauvegarde et restauration
 
 Les mécanismes de sauvegarde ne sont pas détaillés dans les informations d’entrée. Pour une exploitation réelle, ils doivent être documentés avec une politique de rétention, une fréquence, une destination hors hôte et un test périodique de restauration.
@@ -540,6 +552,7 @@ La reprise commence par la restauration de la connectivité réseau, puis du soc
 | Synchronisation pfSense 2 | 10.1.10.3/24                    | VMnet15                                       |
 | Version pfSense           | 2.7.2-RELEASE (amd64)           | Relevée sur la console de pfSense 2           |
 | Interfaces pfSense        | em0 WAN, em1 LAN, em2 SYNC      | Affectation identique sur les deux nœuds à confirmer |
+| NAT sortante              | LAN subnets vers 192.168.112.99 | Mode Hybrid, adresse de sortie commune aux deux nœuds |
 | Plage sans Internet       | 192.168.99.110 à 192.168.99.120 | Communication interne conservée               |
 | DNS AD                    | 192.168.99.15                   | Windows Server 2019                           |
 | Zabbix Server             | 192.168.99.30                   | Debian 13                                     |
