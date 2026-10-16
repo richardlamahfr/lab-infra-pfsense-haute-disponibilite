@@ -16,7 +16,7 @@ Infrastructure de production simulée de 11 machines virtuelles sous VMware Work
 
 | Zone | Réseau | Segment VMware | Rôle |
 |---|---|---|---|
-| WAN | 192.168.112.0/24 | NAT | Sortie Internet, VIP CARP WAN 192.168.112.99 |
+| WAN | 192.168.112.0/24 | NAT | Sortie Internet par la passerelle 192.168.112.2, VIP CARP WAN 192.168.112.99 |
 | LAN | 192.168.99.0/24 | VMnet14 | Serveurs et postes, passerelle virtuelle 192.168.99.100 |
 | Synchronisation | 10.1.10.0/24 | VMnet15 | Synchronisation de la paire pfSense |
 
@@ -43,7 +43,8 @@ Infrastructure de production simulée de 11 machines virtuelles sous VMware Work
 | HA 01b | Arrêt brutal de pfSense 1 pendant un ping continu | Coupure mesurée | **Réussi : environ 3 s** (3 paquets perdus sous Linux, 1 délai d'attente sous Windows) |
 | HA 03 | Arrêt des deux pfSense | Coupure totale, reprise dès qu'un nœud revient | **Conforme** |
 | HA 02 | Retour de pfSense 1 | pfSense 1 redevient MASTER | **Réussi** : pfSense 2 repasse BACKUP automatiquement |
-| HA 04 | Synchronisation des états (pfsync) | Les deux nœuds partagent leurs états | **Non conforme**, correction en cours |
+| HA 04 | Synchronisation des états (pfsync) | Les deux nœuds partagent leurs états | **Réussi** après correction de l'adresse du pair pfsync |
+| HA 05 | Session SSH ouverte pendant une bascule | La session survit | À réaliser |
 
 **Sans pare-feu, aucune sortie :**
 
@@ -65,7 +66,7 @@ Infrastructure de production simulée de 11 machines virtuelles sous VMware Work
 
 ![pfSense 2 BACKUP](docs/images/tests/13-carp-pfsense2-repasse-backup.png)
 
-Détail de la campagne et captures complémentaires : sections 11 à 11.3 du [dossier d'architecture](docs/dossier-architecture.md#11-plan-de-validation).
+Détail de la campagne et captures complémentaires : sections 11 à 11.4 du [dossier d'architecture](docs/dossier-architecture.md#11-plan-de-validation).
 
 ## Problèmes rencontrés et solutions
 
@@ -97,9 +98,37 @@ Détail de la campagne et captures complémentaires : sections 11 à 11.3 du [do
 
 **Résultat** : tous les tests ont pu être menés malgré les ressources limitées.
 
+### 4. Une passerelle WAN mal documentée
+
+**Symptôme** : la première version du dossier présentait 192.168.112.99 comme la passerelle Internet amont des deux pare-feu.
+
+**Cause** : en relisant le statut CARP, 192.168.112.99 apparaît comme la VIP CARP WAN (VHID 1), une adresse portée par la paire pfSense elle-même, donc pas sa passerelle.
+
+**Résolution** : relevé de la vraie passerelle dans System > Routing > Gateways : 192.168.112.2, la passerelle du NAT VMware. Correction du plan d'adressage, des procédures et des schémas.
+
+**Ce que j'en retiens** : une documentation se vérifie sur l'équipement, pas de mémoire.
+
+### 5. Synchronisation des états pfsync inopérante
+
+**Symptôme** : dans Status > CARP, chaque nœud n'affichait que son propre identifiant d'états (6a813fb7 sur pfSense 1, 3280341d sur pfSense 2). pfSense indique que les deux identifiants doivent apparaître sur chaque nœud quand pfsync fonctionne.
+
+**Impact** : CARP basculait bien la VIP, mais le nœud de secours ne connaissait pas les connexions en cours. Un ping repart, une session TCP (SSH, RDP, téléchargement) aurait été coupée à la bascule.
+
+**Diagnostic** :
+1. Ajout d'une règle autorisant tout le trafic sur l'interface SYNC : nécessaire, mais le défaut persiste.
+2. Vérification de System > High Avail Sync : le champ **pfsync Synchronize Peer IP** contenait **192.168.99.1**, l'adresse LAN de pfSense 1. Les états partaient vers une adresse hors du réseau de synchronisation.
+
+**Résolution** : adresse du pair placée sur le réseau SYNC (10.1.10.3 sur pfSense 1, 10.1.10.2 sur pfSense 2) ; synchronisation de configuration XMLRPC configurée uniquement sur le maître.
+
+**Résultat** : chaque nœud affiche les deux identifiants, les tables d'états sont partagées (test HA 04).
+
+![pfsync fonctionnel sur pfSense 1](docs/images/tests/20-pfsync-ok-pfsense1.png)
+
+**Ce que j'en retiens** : quand CARP bascule correctement, cela ne prouve pas que pfsync fonctionne ; les deux se vérifient séparément.
+
 ## Évolutions prévues
 
-- Correction de la synchronisation des états pfsync (HA 04), pour que les connexions TCP survivent à une bascule
+- Test de survie d'une session SSH pendant une bascule (HA 05)
 - WAN des deux nœuds en adresse fixe plutôt qu'en DHCP
 - Segmentation en VLAN (serveurs, utilisateurs, administration, DMZ pour le serveur web)
 - Second contrôleur de domaine et DNS
