@@ -4,7 +4,7 @@
 
 | **Référence** | ARC INFRA 001                                                     |
 |---------------|-------------------------------------------------------------------|
-| **Version**   | 1.4                                                               |
+| **Version**   | 1.5                                                               |
 | **Statut**    | Référence technique                                               |
 | **Date**      | Octobre 2026                                                      |
 | **Auteur**    | Richard Lamah                                                     |
@@ -356,7 +356,7 @@ Le plan suivant transforme l’architecture en critères de recette observables.
 | HA 03 | Double panne | Arrêt des deux pfSense pendant un ping continu, puis redémarrage d’un nœud | Coupure totale, reprise dès qu’un nœud revient | Conforme |
 | HA 02 | Retour du nœud | Redémarrer le nœud initial et contrôler Status > CARP | pfSense 1 redevient MASTER, pfSense 2 repasse BACKUP | Réussi |
 | HA 04 | Synchronisation des états | Contrôler les State Creator Host IDs dans Status > CARP | Les deux identifiants visibles sur chaque nœud | Réussi après correction de l’adresse du pair pfsync (voir 11.3) |
-| HA 05 | Survie d’une session TCP | Session SSH ouverte à travers le pare-feu, puis arrêt de pfSense 1 | La session reste ouverte | À réaliser |
+| HA 05 | Survie d’une session TCP | Téléchargement HTTP continu (curl limité à 200 ko/s), puis arrêt de pfSense 1 | La connexion n’est pas interrompue | Réussi : aucune interruption, débit moyen constant |
 | AD 01 | DNS interne | Résoudre le domaine depuis un poste Windows | Réponse DNS depuis 192.168.99.15 | Capture à ajouter |
 | AD 02 | Domaine | Ouvrir une session avec un compte du domaine | Authentification fonctionnelle | Capture à ajouter |
 | WEB 01 | WordPress | Accéder au site | Page applicative disponible | Capture à ajouter |
@@ -452,6 +452,32 @@ Les machines du LAN, qui utilisent toujours la passerelle 192.168.99.100, retrou
 La page System > Routing > Gateways montre une seule passerelle, WAN_DHCP, à l’adresse 192.168.112.2 (passerelle du NAT VMware), utilisée comme passerelle par défaut. L’adresse 192.168.112.99 est la VIP CARP WAN et non la passerelle amont : le dossier et les schémas ont été corrigés en conséquence.
 
 ![Passerelle WAN 192.168.112.2](images/tests/18-passerelle-wan-192-168-112-2.png)
+
+## 11.5 Survie d’une session TCP pendant la bascule (HA 05)
+
+**Pourquoi ce test.** Un ping prouve que la passerelle bascule, pas que les connexions en cours survivent. Pour cela, il faut une seule connexion TCP longue qui ne se relance pas d’elle-même. Une mise à jour apt ne convient pas : elle ouvre une nouvelle connexion par fichier et réessaie en cas d’échec.
+
+**Méthode.** Depuis Ubuntu Client, téléchargement d’un fichier de 1 Go limité à 200 ko/s pour qu’il dure plusieurs minutes :
+
+`curl --limit-rate 200k -o /dev/null http://speedtest.tele2.net/1GB.zip`
+
+pfSense 1 est arrêté brutalement pendant le transfert.
+
+**Résultat.**
+
+| Heure | pfSense 1 | Temps écoulé | Reçu | Débit moyen |
+|---|---|---|---|---|
+| 16:25 | En service | 0:15 | 3,1 Mo | 199 ko/s |
+| 16:26 | Arrêté | 1:38 | 19,6 Mo | 203 ko/s |
+| 16:27 | Arrêté | 2:29 | 29,6 Mo | 202 ko/s |
+
+Le compteur de temps est continu : c’est la même connexion du début à la fin. Le débit moyen ne baisse pas, la coupure n’est donc pas visible à l’échelle du transfert. La session TCP a été reprise par pfSense 2 grâce à la table d’états synchronisée par pfsync.
+
+![curl avant la bascule, les deux pfSense en service](images/tests/22-curl-avant-bascule-deux-pfsense.png)
+
+![curl après l’arrêt de pfSense 1](images/tests/23-curl-apres-arret-pfsense1.png)
+
+![curl continue sur pfSense 2](images/tests/24-curl-continue-sur-pfsense2.png)
 
 # 12. Continuité, sauvegarde et restauration
 

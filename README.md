@@ -6,7 +6,7 @@ Infrastructure de production simulée de 11 machines virtuelles sous VMware Work
 
 ## Compétences mises en œuvre
 
-- **Réseau et sécurité** : deux pfSense 2.7.2 en haute disponibilité CARP (VIP LAN 192.168.99.100 et VIP WAN 192.168.112.99, synchronisation sur un réseau dédié, bascule mesurée à environ 3 secondes), NAT, filtrage de la sortie Internet par plage d'adresses
+- **Réseau et sécurité** : deux pfSense 2.7.2 en haute disponibilité CARP (VIP LAN 192.168.99.100 et VIP WAN 192.168.112.99, synchronisation sur un réseau dédié, bascule mesurée à environ 3 secondes, sessions TCP conservées grâce à pfsync), NAT, filtrage de la sortie Internet par plage d'adresses
 - **Windows Server** : contrôleur de domaine Active Directory et DNS (Windows Server 2019), quatre postes Windows 10 joints au domaine
 - **Linux** : Debian 13 et Ubuntu Server 24.04, pile web Nginx, MariaDB et WordPress
 - **Supervision** : Zabbix Server avec base MariaDB, agents Zabbix sur les serveurs Linux
@@ -44,7 +44,7 @@ Infrastructure de production simulée de 11 machines virtuelles sous VMware Work
 | HA 03 | Arrêt des deux pfSense | Coupure totale, reprise dès qu'un nœud revient | **Conforme** |
 | HA 02 | Retour de pfSense 1 | pfSense 1 redevient MASTER | **Réussi** : pfSense 2 repasse BACKUP automatiquement |
 | HA 04 | Synchronisation des états (pfsync) | Les deux nœuds partagent leurs états | **Réussi** après correction de l'adresse du pair pfsync |
-| HA 05 | Session SSH ouverte pendant une bascule | La session survit | À réaliser |
+| HA 05 | Téléchargement en cours pendant l'arrêt de pfSense 1 | La connexion TCP survit | **Réussi** : aucune interruption, débit constant à 200 ko/s |
 
 **Sans pare-feu, aucune sortie :**
 
@@ -66,7 +66,11 @@ Infrastructure de production simulée de 11 machines virtuelles sous VMware Work
 
 ![pfSense 2 BACKUP](docs/images/tests/13-carp-pfsense2-repasse-backup.png)
 
-Détail de la campagne et captures complémentaires : sections 11 à 11.4 du [dossier d'architecture](docs/dossier-architecture.md#11-plan-de-validation).
+**Session TCP : un téléchargement en cours continue sans interruption quand pfSense 1 s'arrête (pfsync) :**
+
+![curl continue après l'arrêt de pfSense 1](docs/images/tests/23-curl-apres-arret-pfsense1.png)
+
+Détail de la campagne et captures complémentaires : sections 11 à 11.5 du [dossier d'architecture](docs/dossier-architecture.md#11-plan-de-validation).
 
 ## Problèmes rencontrés et solutions
 
@@ -128,7 +132,6 @@ Détail de la campagne et captures complémentaires : sections 11 à 11.4 du [do
 
 ## Évolutions prévues
 
-- Test de survie d'une session SSH pendant une bascule (HA 05)
 - WAN des deux nœuds en adresse fixe plutôt qu'en DHCP
 - Segmentation en VLAN (serveurs, utilisateurs, administration, DMZ pour le serveur web)
 - Second contrôleur de domaine et DNS
