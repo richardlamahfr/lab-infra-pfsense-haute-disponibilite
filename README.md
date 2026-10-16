@@ -6,7 +6,7 @@ Infrastructure de production simulée de 11 machines virtuelles sous VMware Work
 
 ## Compétences mises en œuvre
 
-- **Réseau et sécurité** : deux pfSense 2.7.2 en haute disponibilité (passerelle virtuelle 192.168.99.100, synchronisation sur un réseau dédié, bascule mesurée à environ 3 secondes), NAT, filtrage de la sortie Internet par plage d'adresses
+- **Réseau et sécurité** : deux pfSense 2.7.2 en haute disponibilité CARP (VIP LAN 192.168.99.100 et VIP WAN 192.168.112.99, synchronisation sur un réseau dédié, bascule mesurée à environ 3 secondes), NAT, filtrage de la sortie Internet par plage d'adresses
 - **Windows Server** : contrôleur de domaine Active Directory et DNS (Windows Server 2019), quatre postes Windows 10 joints au domaine
 - **Linux** : Debian 13 et Ubuntu Server 24.04, pile web Nginx, MariaDB et WordPress
 - **Supervision** : Zabbix Server avec base MariaDB, agents Zabbix sur les serveurs Linux
@@ -16,7 +16,7 @@ Infrastructure de production simulée de 11 machines virtuelles sous VMware Work
 
 | Zone | Réseau | Segment VMware | Rôle |
 |---|---|---|---|
-| WAN | 192.168.112.0/24 | NAT | Sortie Internet des deux pfSense |
+| WAN | 192.168.112.0/24 | NAT | Sortie Internet, VIP CARP WAN 192.168.112.99 |
 | LAN | 192.168.99.0/24 | VMnet14 | Serveurs et postes, passerelle virtuelle 192.168.99.100 |
 | Synchronisation | 10.1.10.0/24 | VMnet15 | Synchronisation de la paire pfSense |
 
@@ -42,7 +42,8 @@ Infrastructure de production simulée de 11 machines virtuelles sous VMware Work
 | NET 03 | Sortie Internet depuis 192.168.99.110 à .120 | Bloquée, LAN joignable | **Réussi** |
 | HA 01b | Arrêt brutal de pfSense 1 pendant un ping continu | Coupure mesurée | **Réussi : environ 3 s** (3 paquets perdus sous Linux, 1 délai d'attente sous Windows) |
 | HA 03 | Arrêt des deux pfSense | Coupure totale, reprise dès qu'un nœud revient | **Conforme** |
-| HA 02 | Retour du nœud initial | Configuration synchronisée | À réaliser |
+| HA 02 | Retour de pfSense 1 | pfSense 1 redevient MASTER | **Réussi** : pfSense 2 repasse BACKUP automatiquement |
+| HA 04 | Synchronisation des états (pfsync) | Les deux nœuds partagent leurs états | **Non conforme**, correction en cours |
 
 **Sans pare-feu, aucune sortie :**
 
@@ -58,7 +59,13 @@ Infrastructure de production simulée de 11 machines virtuelles sous VMware Work
 
 ![Bascule à chaud](docs/images/tests/07-bascule-arret-pfsense1-ubuntu.png)
 
-Détail de la campagne et captures complémentaires : section 11 du [dossier d'architecture](docs/dossier-architecture.md#11-plan-de-validation).
+**Statut CARP : pfSense 2 devient MASTER quand pfSense 1 tombe, puis repasse BACKUP à son retour :**
+
+![pfSense 2 MASTER](docs/images/tests/12-carp-pfsense2-devient-master.png)
+
+![pfSense 2 BACKUP](docs/images/tests/13-carp-pfsense2-repasse-backup.png)
+
+Détail de la campagne et captures complémentaires : sections 11 à 11.3 du [dossier d'architecture](docs/dossier-architecture.md#11-plan-de-validation).
 
 ## Problèmes rencontrés et solutions
 
@@ -92,7 +99,8 @@ Détail de la campagne et captures complémentaires : section 11 du [dossier d'a
 
 ## Évolutions prévues
 
-- Test du retour du nœud initial (HA 02) et réduction du temps de bascule
+- Correction de la synchronisation des états pfsync (HA 04), pour que les connexions TCP survivent à une bascule
+- WAN des deux nœuds en adresse fixe plutôt qu'en DHCP
 - Segmentation en VLAN (serveurs, utilisateurs, administration, DMZ pour le serveur web)
 - Second contrôleur de domaine et DNS
 - Sauvegarde des VM et des configurations, avec test de restauration (RPO et RTO mesurés)

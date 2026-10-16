@@ -4,7 +4,7 @@
 
 | **Référence** | ARC INFRA 001                                                     |
 |---------------|-------------------------------------------------------------------|
-| **Version**   | 1.1                                                               |
+| **Version**   | 1.2                                                               |
 | **Statut**    | Référence technique                                               |
 | **Date**      | Octobre 2026                                                      |
 | **Auteur**    | Richard Lamah                                                     |
@@ -98,7 +98,7 @@ Le chemin principal de communication est structuré autour de deux plans réseau
 
 | **Zone**        | **Réseau**       | **Équipements**                          | **Usage**                                       |
 |-----------------|------------------|------------------------------------------|-------------------------------------------------|
-| Accès amont     | 192.168.112.0/24 | Deux interfaces WAN pfSense              | Accès Internet via la passerelle 192.168.112.99 |
+| Accès amont     | 192.168.112.0/24 | Deux interfaces WAN pfSense et la VIP WAN 192.168.112.99 | Accès Internet par le NAT VMware |
 | LAN             | 192.168.99.0/24  | Deux LAN pfSense et toutes les autres VM | Services internes, postes, administration       |
 | Synchronisation | 10.1.10.0/24     | pfSense 1 et pfSense 2                   | Synchronisation de la paire HA                  |
 
@@ -118,9 +118,9 @@ Le réseau VMnet14 constitue le domaine de niveau deux communs aux postes, aux s
 |-----------------|--------------------|------------------|-------------------------|----------------|
 | LAN             | VMnet14            | 192.168.99.0/24  | Production interne      | 192.168.99.100 |
 | Synchronisation | VMnet15            | 10.1.10.0/24     | Synchronisation pfSense | Aucune         |
-| WAN             | NAT VMware         | 192.168.112.0/24 | Sortie Internet         | 192.168.112.99 |
+| WAN             | NAT VMware         | 192.168.112.0/24 | Sortie Internet         | Passerelle NAT VMware (à relever) |
 
-*Le masque WAN est documenté ici en /24 pour représenter le segment fourni avec les adresses 192.168.112.138, 192.168.112.139 et la passerelle 192.168.112.99. Cette valeur doit rester alignée avec le réseau NAT réellement configuré dans l’hyperviseur.*
+*Le masque /24 du WAN est confirmé par la console de pfSense. L’adresse 192.168.112.99 n’est pas la passerelle amont : c’est la VIP CARP WAN (VHID 1) partagée par la paire pfSense. La passerelle amont est celle du NAT VMware, à relever dans System > Routing > Gateways.*
 
 ## 3.2 Plan d’adressage des équipements
 
@@ -128,11 +128,12 @@ Le réseau VMnet14 constitue le domaine de niveau deux communs aux postes, aux s
 |---------------------------|---------------|-----------------|------------|----------------|----------------|-----------------------------------|
 | pfSense 1                 | LAN           | 192.168.99.1    | /24        | Selon HA       | Non applicable | Pare-feu actif                    |
 | pfSense 1                 | SYNC          | 10.1.10.2       | /24        | Aucune         | Non applicable | Synchronisation                   |
-| pfSense 1                 | WAN           | 192.168.112.138 | /24        | 192.168.112.99 | Non applicable | Accès amont                       |
+| pfSense 1                 | WAN           | 192.168.112.138 | /24        | NAT VMware     | Non applicable | Accès amont                       |
 | pfSense 2                 | LAN           | 192.168.99.2    | /24        | Selon HA       | Non applicable | Pare-feu secours                  |
 | pfSense 2                 | SYNC          | 10.1.10.3       | /24        | Aucune         | Non applicable | Synchronisation                   |
-| pfSense 2                 | WAN           | 192.168.112.139 | /24        | 192.168.112.99 | Non applicable | Accès amont                       |
-| VIP LAN                   | HA            | 192.168.99.100  | /24        | Non applicable | Non applicable | Passerelle des équipements        |
+| pfSense 2                 | WAN           | 192.168.112.139 | /24        | NAT VMware     | Non applicable | Accès amont, adresse obtenue par DHCP |
+| VIP LAN                   | CARP VHID 2   | 192.168.99.100  | /24        | Non applicable | Non applicable | Passerelle des équipements        |
+| VIP WAN                   | CARP VHID 1   | 192.168.112.99  | /24        | Non applicable | Non applicable | Adresse de sortie Internet de la paire |
 | Windows Server 2019       | LAN           | 192.168.99.15   | /24        | 192.168.99.100 | 192.168.99.15  | Active Directory et DNS           |
 | Windows 001 Marketing     | LAN           | 192.168.99.20   | /24        | 192.168.99.100 | 192.168.99.15  | Poste du domaine                  |
 | Windows 001 Direction     | LAN           | 192.168.99.6    | /24        | 192.168.99.100 | 192.168.99.15  | Poste du domaine                  |
@@ -297,7 +298,7 @@ Le réseau utilisateur et serveur est actuellement regroupé dans 192.168.99.0/2
 | Zabbix Server    | Ubuntu Server 24 et Kali | Collecte selon mode de fonctionnement | LAN        | Autoriser les ports Zabbix nécessaires       |
 | WordPress        | MariaDB locale           | Accès base applicative                | Local      | Ne pas exposer la base au LAN si inutile     |
 | pfSense 1        | pfSense 2                | Synchronisation HA                    | VMnet15    | Autoriser uniquement les flux HA nécessaires |
-| pfSense actif    | 192.168.112.99           | Routage vers le réseau amont          | WAN        | Autoriser la sortie du nœud actif            |
+| pfSense actif    | Passerelle NAT VMware    | Routage vers le réseau amont depuis la VIP WAN 192.168.112.99 | WAN        | Autoriser la sortie du nœud actif            |
 
 # 10. Exploitation et procédures
 
@@ -319,7 +320,7 @@ Le réseau utilisateur et serveur est actuellement regroupé dans 192.168.99.0/2
 
 1. Tester la passerelle 192.168.99.100 depuis un poste du LAN.
 2. Vérifier quel pfSense porte la passerelle virtuelle.
-3. Tester la communication entre le nœud actif et la passerelle WAN 192.168.112.99.
+3. Tester la communication entre le nœud actif et la passerelle NAT VMware, et vérifier que le nœud actif porte la VIP WAN 192.168.112.99.
 4. Contrôler l’interface WAN et la route par défaut du nœud actif.
 5. Vérifier la présence du nœud de secours et son état de synchronisation.
 6. En cas de panne du nœud actif, déclencher ou constater la bascule puis refaire les tests fonctionnels.
@@ -353,7 +354,8 @@ Le plan suivant transforme l’architecture en critères de recette observables.
 | HA 01 | Reprise par le nœud de secours | pfSense 1 arrêté, seul pfSense 2 en service | La VIP 192.168.99.100 reste disponible | Réussi : pfSense 2 assure seul la sortie Internet (ping 8.8.8.8 sans perte, 28 à 39 ms) |
 | HA 01b | Bascule à chaud | Ping continu depuis un poste, puis arrêt brutal de pfSense 1 en cours de trafic | Nombre de paquets perdus mesuré | Réussi : environ 3 s de coupure (3 paquets perdus sous Linux, 1 délai d’attente sous Windows) |
 | HA 03 | Double panne | Arrêt des deux pfSense pendant un ping continu, puis redémarrage d’un nœud | Coupure totale, reprise dès qu’un nœud revient | Conforme |
-| HA 02 | Retour du nœud | Redémarrer le nœud initial et vérifier la synchronisation | Aucune perte durable de configuration | À réaliser |
+| HA 02 | Retour du nœud | Redémarrer le nœud initial et contrôler Status > CARP | pfSense 1 redevient MASTER, pfSense 2 repasse BACKUP | Réussi |
+| HA 04 | Synchronisation des états | Contrôler les State Creator Host IDs dans Status > CARP | Les deux identifiants visibles sur chaque nœud | Non conforme : chaque nœud ne voit que son propre identifiant |
 | AD 01 | DNS interne | Résoudre le domaine depuis un poste Windows | Réponse DNS depuis 192.168.99.15 | Capture à ajouter |
 | AD 02 | Domaine | Ouvrir une session avec un compte du domaine | Authentification fonctionnelle | Capture à ajouter |
 | WEB 01 | WordPress | Accéder au site | Page applicative disponible | Capture à ajouter |
@@ -401,6 +403,30 @@ Les machines du LAN, qui utilisent toujours la passerelle 192.168.99.100, retrou
 ![Double panne : plus de passerelle disponible](images/tests/08-double-panne-ubuntu.png)
 
 **Conclusion.** La bascule entre les deux pare-feu coûte environ 3 secondes de coupure, sans aucune action sur les postes. La redondance protège contre la perte d’un nœud, pas contre la perte des deux.
+
+## 11.3 Statut CARP et retour du nœud principal
+
+**Fonctionnement normal.** pfSense 1 est MASTER sur les deux VIP (WAN@1 192.168.112.99 et LAN@2 192.168.99.100), pfSense 2 est BACKUP.
+
+![pfSense 1 MASTER](images/tests/10-carp-pfsense1-master.png)
+
+![pfSense 2 BACKUP](images/tests/11-carp-pfsense2-backup.png)
+
+**pfSense 1 arrêté.** pfSense 2 passe MASTER sur les deux VIP.
+
+![pfSense 2 devient MASTER](images/tests/12-carp-pfsense2-devient-master.png)
+
+**pfSense 1 redémarré (HA 02).** pfSense 1 reprend le rôle de maître et pfSense 2 repasse BACKUP sans intervention.
+
+![pfSense 2 repasse BACKUP](images/tests/13-carp-pfsense2-repasse-backup.png)
+
+**Mesure de la coupure.** Avec `ping -O`, les requêtes perdues sont affichées : 3 requêtes sans réponse (icmp_seq 15 à 17) lors de la bascule, soit environ 3 secondes. Sur une série complète de 270 requêtes, 3 sont perdues (1,1 %).
+
+![Paquets perdus affichés par ping -O](images/tests/15-ping-O-paquets-perdus.png)
+
+![Bilan du ping : 270 envoyés, 267 reçus](images/tests/14-ping-bilan-1-pourcent.png)
+
+**Constat : synchronisation des états non fonctionnelle (HA 04).** Dans la section State Synchronization Status, chaque nœud n’affiche que son propre identifiant (6a813fb7 sur pfSense 1, 3280341d sur pfSense 2). Selon pfSense, les deux identifiants doivent apparaître sur chaque nœud quand la synchronisation des états (pfsync) fonctionne. Conséquence : lors d’une bascule, les connexions en cours ne sont pas reprises par le nœud de secours. Le ping repart car chaque requête est indépendante, mais une session TCP (SSH, RDP, téléchargement) serait coupée. Correction à mener dans System > High Avail Sync (synchronisation des états sur l’interface SYNC, adresse du pair) et dans les règles de l’interface SYNC.
 
 # 12. Continuité, sauvegarde et restauration
 
@@ -456,7 +482,9 @@ La reprise commence par la restauration de la connectivité réseau, puis du soc
 | VIP LAN                   | 192.168.99.100                  | Passerelle logique de la paire pfSense        |
 | WAN pfSense 1             | 192.168.112.138                 | Réseau amont                                  |
 | WAN pfSense 2             | 192.168.112.139/24              | Obtenue par DHCP sur le NAT VMware            |
-| Passerelle WAN            | 192.168.112.99                  | Passerelle amont commune                      |
+| VIP WAN                   | 192.168.112.99/24               | VIP CARP VHID 1, adresse de sortie Internet   |
+| VIP LAN (VHID)            | 192.168.99.100/24               | VIP CARP VHID 2                               |
+| Passerelle WAN amont      | Passerelle NAT VMware           | À relever dans System > Routing > Gateways    |
 | Synchronisation pfSense 1 | 10.1.10.2/24                    | VMnet15                                       |
 | Synchronisation pfSense 2 | 10.1.10.3/24                    | VMnet15                                       |
 | Version pfSense           | 2.7.2-RELEASE (amd64)           | Relevée sur la console de pfSense 2           |
