@@ -1,160 +1,384 @@
-# Lab d'infrastructure virtualisée : pfSense HA, Active Directory, Zabbix
+# Lab Active Directory, segmentation réseau et PowerShell
 
-Infrastructure de production simulée de 11 machines virtuelles sous VMware Workstation, conçue pour reproduire le système d'information d'une petite entreprise : pare-feu redondants, annuaire Active Directory, serveur web et supervision centralisée.
+Suite du [lab pfSense en haute disponibilité](https://github.com/richardlamahfr/lab-infra-pfsense-haute-disponibilite). Le réseau unique du départ est découpé en trois zones de sécurité filtrées par la paire pfSense : un LAN pour les postes et l'annuaire, une DMZ pour le serveur web exposé et une zone dédiée au serveur de fichiers. Ce socle accueille ensuite l'automatisation Active Directory en PowerShell.
 
-![Architecture réseau](docs/images/architecture-reseau.png)
+![Architecture en trois zones](docs/images/architecture-3-zones.png)
 
 ## Compétences mises en œuvre
 
-- **Réseau et sécurité** : deux pfSense 2.7.2 en haute disponibilité CARP (VIP LAN 192.168.99.100 et VIP WAN 192.168.112.99, synchronisation sur un réseau dédié, bascule mesurée à environ 3 secondes, sessions TCP conservées grâce à pfsync), NAT sortante sur la VIP WAN, filtrage de la sortie Internet par plage d'adresses
-- **Windows Server** : contrôleur de domaine Active Directory et DNS (Windows Server 2019), quatre postes Windows 10 joints au domaine
-- **Linux** : Debian 13 et Ubuntu Server 24.04, pile web Nginx, MariaDB et WordPress
-- **Supervision** : Zabbix Server avec base MariaDB, agents Zabbix sur les serveurs Linux
-- **Documentation** : dossier d'architecture, plan de validation, procédures d'incident
+- **Segmentation réseau** : trois zones derrière une paire pfSense CARP, une VIP passerelle par zone, NAT sortante de chaque zone sur la VIP WAN
+- **Filtrage** : règles par interface d'entrée, alias (réseaux privés, ports web, ports Active Directory), refus par défaut, journalisation des blocages
+- **Active Directory** : serveur Windows Server 2025 dans une zone dédiée, joint au domaine `ecole-gn.gn` à travers le pare-feu avec uniquement les ports AD ouverts
+- **Partages de fichiers** : modèle AGDLP, droits NTFS avec `icacls`, partage SMB avec énumération basée sur l'accès, données sur un disque dédié
+- **Méthode** : preuve du défaut avant correction, tests de non-régression après correction
 
-## Architecture
+## Plan d'adressage
 
-| Zone | Réseau | Segment VMware | Rôle |
-|---|---|---|---|
-| WAN | 192.168.112.0/24 | NAT | Sortie Internet par la passerelle 192.168.112.2, VIP CARP WAN 192.168.112.99 |
-| LAN | 192.168.99.0/24 | VMnet14 | Serveurs et postes, passerelle virtuelle 192.168.99.100 |
-| Synchronisation | 10.1.10.0/24 | VMnet15 | Synchronisation de la paire pfSense |
+| Zone | Réseau | Passerelle (VIP CARP) | pfSense 1 / 2 | Machines |
+|---|---|---|---|---|
+| LAN | 192.168.99.0/24 | 192.168.99.100 | .1 / .2 | AD et DNS (WS2019) .15, Zabbix .30, postes |
+| DMZ | 192.168.20.0/29 | 192.168.20.5 | .2 / .3 | Ubuntu Server 24.04 (WordPress) .1 |
+| FileServer | 192.168.240.0/29 | 192.168.240.5 | .2 / .3 | Windows Server 2025 .1 |
+| WAN | 192.168.112.0/24 | Passerelle NAT 192.168.112.2 | .138 / .139 | VIP de sortie 192.168.112.99 |
 
-| Machine | Système | Adresse | Rôle |
-|---|---|---|---|
-| pfSense 1 / pfSense 2 | pfSense 2.7.2 | 192.168.99.1 / .2 | Pare-feu actif / secours |
-| Serveur AD | Windows Server 2019 | 192.168.99.15 | Active Directory, DNS |
-| 4 postes | Windows 10 | .6, .7, .10, .20 | Direction, Développement, Comptabilité, Marketing |
-| Serveur Zabbix | Debian 13 | 192.168.99.30 | Zabbix Server, MariaDB |
-| Serveur web | Ubuntu Server 24.04 | 192.168.99.16 | WordPress, Nginx, MariaDB |
-| Kali | Kali Linux | 192.168.99.25 | Tests de sécurité |
-| Client Linux | Ubuntu | 192.168.99.8 | Poste Linux |
+Un /29 offre six adresses utilisables : le serveur, les deux pfSense et la VIP en occupent quatre. C'est suffisant pour une zone à un seul serveur et cela limite la surface d'adressage.
 
-![Haute disponibilité](docs/images/haute-disponibilite.png)
+**Postes du domaine** : Direction sous Windows 11, Développement, Comptabilité et Marketing sous Windows 10. Les nouveaux postes reçoivent leur adresse du serveur DHCP du contrôleur de domaine (plage 192.168.99.55 à 192.168.99.70) ; le poste Marketing (PLT-001-Marketing) est passé en DHCP.
 
-## Tests de validation (16 octobre 2026)
+## Matrice des flux
+
+| Source ↓ / Destination → | LAN | DMZ | FileServer | Internet |
+|---|---|---|---|---|
+| **LAN** | — | Autorisé | Autorisé | Autorisé |
+| **DMZ** | **Bloqué**, sauf agent Zabbix vers 192.168.99.30:10051 | — | **Bloqué** | HTTP, HTTPS, ICMP |
+| **FileServer** | Ports AD vers 192.168.99.15 uniquement | **Bloqué** | — | HTTP, HTTPS, ICMP |
+
+Le DNS de la DMZ passe par pfSense (VIP 192.168.20.5) ; celui de FileServer par le contrôleur de domaine.
+
+## Règles pfSense
+
+**Principe** : une règle se place sur l'onglet de l'interface par laquelle le trafic **entre** dans le pare-feu. Les règles sont lues de haut en bas, la première qui correspond s'applique, tout le reste est refusé.
+
+**Alias**
+
+| Nom | Contenu |
+|---|---|
+| `RESEAUX_PRIVES` | 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16 |
+| `PORTS_WEB` | 80, 443 |
+| `PORTS_AD` | 53, 88, 123, 135, 389, 445, 464, 636, 3268, 3269, 49152 à 65535 |
+
+**Onglet DMZ**
+
+| # | Action | Proto | Source | Destination | Port |
+|---|---|---|---|---|---|
+| 1 | Pass | TCP/UDP | DMZ subnets | This Firewall (self) | 53 |
+| 2 | Pass | TCP | DMZ subnets | 192.168.99.30 (Zabbix) | 10051 |
+| 3 | Block, journalisé | any | DMZ subnets | RESEAUX_PRIVES | * |
+| 4 | Pass | TCP | DMZ subnets | any | PORTS_WEB |
+| 5 | Pass | ICMP | DMZ subnets | any | * |
+
+**Onglet FILESERVER**
+
+| # | Action | Proto | Source | Destination | Port |
+|---|---|---|---|---|---|
+| 1 | Pass | TCP/UDP | FILESERVER subnets | 192.168.99.15 | PORTS_AD |
+| 2 | Block, journalisé | any | FILESERVER subnets | RESEAUX_PRIVES | * |
+| 3 | Pass | TCP | FILESERVER subnets | any | PORTS_WEB |
+| 4 | Pass | ICMP | FILESERVER subnets | any | * |
+
+Captures des règles en place : [onglet DMZ](docs/images/tests/09-regles-dmz.png) (avant correction de l'adresse Zabbix) et [onglet FILESERVER](docs/images/tests/10-regles-fileserver.png).
+
+**NAT sortante** (mode Hybrid) : LAN subnets, 192.168.20.0/29 et 192.168.240.0/29 traduits vers la VIP WAN 192.168.112.99, pour que les connexions de chaque zone survivent à une bascule.
+
+## Tests de validation (21 octobre 2026)
 
 | ID | Test | Résultat attendu | Résultat obtenu |
 |---|---|---|---|
-| Référence | Les deux pfSense arrêtés | Aucune sortie Internet | Conforme : « Destination Host Unreachable » sur Ubuntu, pas d'Internet sur Windows Server |
-| HA 01 | pfSense 1 arrêté, pfSense 2 seul | La passerelle 192.168.99.100 reste disponible | **Réussi** : ping 8.8.8.8 sans perte (28 à 39 ms), navigation web depuis Windows Server |
-| NET 02 | Sortie Internet depuis le LAN | Accès fonctionnel | **Réussi** |
-| NET 03 | Sortie Internet depuis 192.168.99.110 à .120 | Bloquée, LAN joignable | **Réussi** |
-| HA 01b | Arrêt brutal de pfSense 1 pendant un ping continu | Coupure mesurée | **Réussi : environ 3 s** (3 paquets perdus sous Linux, 1 délai d'attente sous Windows) |
-| HA 03 | Arrêt des deux pfSense | Coupure totale, reprise dès qu'un nœud revient | **Conforme** |
-| HA 02 | Retour de pfSense 1 | pfSense 1 redevient MASTER | **Réussi** : pfSense 2 repasse BACKUP automatiquement |
-| HA 04 | Synchronisation des états (pfsync) | Les deux nœuds partagent leurs états | **Réussi** après correction de l'adresse du pair pfsync |
-| HA 05 | Téléchargement en cours pendant l'arrêt de pfSense 1 | La connexion TCP survit | **Réussi** : aucune interruption, débit constant à 200 ko/s |
+| SEG 00 | Avant correction : DMZ vers AD, ports 445 et 389 | Doit être bloqué | **Défaut constaté** : connexions réussies |
+| SEG 01 | Après correction : DMZ vers AD, port 445 | Bloqué | **Réussi** : connexion expirée (timed out) |
+| SEG 02 | DMZ : résolution DNS et HTTPS vers Internet | Réponse HTTP | **Réussi** : HTTP/2 200 |
+| SEG 03 | FileServer vers serveur web DMZ, port 80 | Bloqué | **Réussi** : TcpTestSucceeded False |
+| SEG 04 | FileServer vers AD, port 389 | Autorisé | **Réussi** : TcpTestSucceeded True |
+| SEG 05 | FileServer membre du domaine | Canal sécurisé valide | **Réussi** : Test-ComputerSecureChannel True |
+| SEG 06 | Blocages visibles dans les journaux pfSense | Lignes Block DMZ vers LAN | **Réussi** : 192.168.20.1 vers 192.168.99.15:445 bloqué par la règle journalisée |
+| SEG 07 | Supervision du serveur web en DMZ | Hôte joignable dans Zabbix | **Réussi** : ZBX au vert sur 192.168.20.1 |
 
-**Sans pare-feu, aucune sortie :**
+**Avant correction, la DMZ joignait le contrôleur de domaine :**
 
-![Ubuntu sans pfSense](docs/images/tests/03-ubuntu-ping-sans-pfsense.png)
+![DMZ vers AD avant correction](docs/images/tests/01-avant-dmz-joint-ad-445-389.png)
 
-**pfSense 1 arrêté : pfSense 2 reprend seul le trafic :**
+**Après correction, la DMZ ne joint plus le contrôleur de domaine, et le blocage est journalisé :**
 
-![Console pfSense 2](docs/images/tests/01-console-pfsense2-interfaces.png)
+![DMZ vers AD après correction](docs/images/tests/06-apres-dmz-vers-ad-timed-out.png)
 
-![Ubuntu via pfSense 2](docs/images/tests/04-ubuntu-ping-via-pfsense2.png)
+![Journaux pfSense : DMZ vers AD bloqué](docs/images/tests/07-journaux-dmz-vers-ad-bloque.png)
 
-**Bascule à chaud : pfSense 1 arrêté en plein trafic.** Les requêtes 55, 56 et 57 n'ont pas de réponse (sous Linux, ping n'affiche pas les pertes, elles se lisent dans les numéros manquants), puis le trafic repart par pfSense 2 :
+**Après correction, FileServer ne joint plus la DMZ mais joint toujours l'AD :**
 
-![Bascule à chaud](docs/images/tests/07-bascule-arret-pfsense1-ubuntu.png)
+![FileServer vers DMZ bloqué](docs/images/tests/04-fileserver-vers-dmz-bloque.png)
 
-**Statut CARP : pfSense 2 devient MASTER quand pfSense 1 tombe, puis repasse BACKUP à son retour :**
+![FileServer vers AD autorisé](docs/images/tests/05-fileserver-vers-ad-ldap-ok.png)
 
-![pfSense 2 MASTER](docs/images/tests/12-carp-pfsense2-devient-master.png)
+**La DMZ résout les noms par pfSense et sort en HTTPS :**
 
-![pfSense 2 BACKUP](docs/images/tests/13-carp-pfsense2-repasse-backup.png)
+![DMZ DNS et HTTPS](docs/images/tests/02-dmz-dns-https-ok.png)
 
-**Session TCP : un téléchargement en cours continue sans interruption quand pfSense 1 s'arrête (pfsync) :**
+**FileServer est bien membre du domaine :**
 
-![curl continue après l'arrêt de pfSense 1](docs/images/tests/23-curl-apres-arret-pfsense1.png)
+![Canal sécurisé](docs/images/tests/03-fileserver-dans-le-domaine.png)
 
-Détail de la campagne et captures complémentaires : sections 11 à 11.6 du [dossier d'architecture](docs/dossier-architecture.md#11-plan-de-validation).
+## DHCP sur le contrôleur de domaine
+
+Le serveur DHCP de pfSense est désactivé sur le LAN : un seul serveur DHCP par réseau, le rôle DHCP de Windows Server 2019 (192.168.99.15).
+
+| Paramètre | Valeur |
+|---|---|
+| Étendue | 192.168.99.0/24 |
+| Plage distribuée | 192.168.99.55 à 192.168.99.70 (16 adresses, hors adresses fixes, VIP et plage sans Internet) |
+| 003 Routeur | 192.168.99.100 (VIP CARP) |
+| 006 Serveurs DNS | 192.168.99.15 uniquement |
+| 015 Nom de domaine DNS | ecole-gn.gn |
+
+| ID | Test | Résultat attendu | Résultat obtenu |
+|---|---|---|---|
+| DHCP 01 | Bail obtenu par un poste du LAN | Adresse dans la plage, serveur 192.168.99.15 | **Réussi** : 192.168.99.55 |
+| DHCP 02 | Passerelle distribuée | 192.168.99.100 | **Réussi** après correction |
+| DHCP 03 | DNS distribué | 192.168.99.15 seul | **Réussi** après correction |
+| DHCP 04 | Accès Internet et résolution du domaine depuis le poste | `ping 8.8.8.8` et `nslookup ecole-gn.gn` répondent | **Réussi** : 0 % de perte, ecole-gn.gn résolu en 192.168.99.15 |
+| DHCP 05 | Serveur DHCP autorisé dans l'AD | `Get-DhcpServerInDC` liste 192.168.99.15 | **Réussi** : wn-server.ecole-gn.gn autorisé |
+
+![Poste : Internet et DNS de l'AD](docs/images/tests/14-dhcp-poste-internet-et-dns-ad.png)
+
+![Serveur DHCP autorisé dans l'AD](docs/images/tests/15-dhcp-autorise-dans-ad.png)
+
+*Remarque : `nslookup` affiche « Server: UnKnown » car il n'existe pas encore de zone de recherche inversée (192.168.99.x) pour retrouver le nom du serveur DNS à partir de son adresse. Création prévue.*
+
+## Automatisation Active Directory en PowerShell
+
+Le script [`scripts/New-LabADStructure.ps1`](scripts/New-LabADStructure.ps1) s'appuie sur l'arborescence `Site_Paris` et la complète à partir de deux fichiers :
+- [`scripts/utilisateurs.csv`](scripts/utilisateurs.csv) : 30 utilisateurs fictifs (Direction 3, RH 3, Développement 8, Comptabilité 6, Marketing 10) ;
+- [`scripts/ordinateurs.csv`](scripts/ordinateurs.csv) : les 4 postes du domaine et leur service.
+
+```
+ecole-gn.gn
+└── OU Site_Paris
+    ├── OU Admin            comptes d'administration de l'infrastructure (séparés des utilisateurs)
+    ├── OU Comptabilite
+    │   ├── OU users        utilisateurs du service
+    │   └── OU computers    postes du service (LAT-001-COMPT)
+    ├── OU Developpement    (users, computers : LAP-001-DEV)
+    ├── OU Direction        (users, computers : LAT-001-DIREC)
+    ├── OU Marketing        (users, computers : PLT-001-MARKETI)
+    ├── OU RH               (users, computers)
+    ├── OU Groupes          GRP_Comptabilite, GRP_Developpement, GRP_Direction, GRP_Marketing, GRP_RH
+    └── OU Serveurs         FILESERVER (Windows Server 2025)
+```
+
+**Pourquoi déplacer les postes** : `Computers` et `Users` sont des conteneurs par défaut, pas des OU. On ne peut pas y lier de GPO ; les postes doivent donc être rangés dans une OU pour recevoir des stratégies ordinateur.
+
+**Choix de conception**
+
+| Choix | Raison |
+|---|---|
+| Organisation par service, puis par type d'objet (`users`, `computers`) | Une GPO liée à `Site_Paris` touche toute l'entreprise, une GPO liée à `Marketing\computers` seulement les postes du Marketing |
+| Comptes d'administration dans une OU `Admin` distincte | Leur appliquer des règles plus strictes et ne jamais les mélanger aux comptes du quotidien |
+| Identifiant `prenom.nom`, sans accents, 20 caractères maximum | Limite du sAMAccountName ; « Hélène Martin » devient `helene.martin` |
+| Suffixe numérique en cas d'homonyme | Deux « Mamadou Diallo » donnent `mamadou.diallo` puis `mamadou.diallo2` |
+| Mot de passe demandé à l'exécution, seulement si un compte doit être créé ; changement obligatoire à la première connexion | Aucun mot de passe écrit dans le script ni dans le dépôt ; une relance ou une simulation ne le demande pas |
+| Script idempotent | Un objet existant ou déjà à sa place est ignoré : le script peut être relancé sans erreur |
+| Prise en charge de `-WhatIf` | Simulation complète avant toute modification de l'annuaire |
+| OU créées protégées contre la suppression accidentelle | Bonne pratique Active Directory |
+| Journal horodaté de chaque exécution | Traçabilité des opérations |
+
+**Utilisation**, sur le contrôleur de domaine, dans une console PowerShell en administrateur. Le script se récupère directement depuis ce dépôt :
+
+```powershell
+New-Item C:\Scripts -ItemType Directory -Force | Out-Null
+$base = "https://raw.githubusercontent.com/richardlamahfr/lab-ad-segmentation-powershell/main/scripts"
+"New-LabADStructure.ps1","utilisateurs.csv","ordinateurs.csv" | ForEach-Object { Invoke-WebRequest "$base/$_" -OutFile "C:\Scripts\$_" }
+cd C:\Scripts
+.\New-LabADStructure.ps1 -WhatIf     # 1. simulation
+.\New-LabADStructure.ps1             # 2. exécution réelle
+.\New-LabADStructure.ps1             # 3. relance : tout doit être ignoré
+```
+
+| ID | Test | Résultat attendu | Résultat obtenu (25 octobre 2026) |
+|---|---|---|---|
+| PS 01 | Simulation `-WhatIf` | Liste des opérations, aucune modification | **Réussi** : OU Groupes, 5 groupes, 29 utilisateurs et 4 postes annoncés, 0 erreur |
+| PS 02 | Exécution réelle | OU Groupes, 5 groupes, utilisateurs créés, 4 postes déplacés, 0 erreur | **Réussi** : 29 créés, 1 ignoré (compte existant `mamadoud`), 4 postes déplacés, 0 erreur, en 3 secondes |
+| PS 03 | Relance | Tout est ignoré, 0 erreur | **Réussi** : OU, groupes et utilisateurs signalés « déjà présents » |
+| PS 04 | Contrôle dans l'annuaire | Groupes de 6, 8, 3, 10 et 3 membres ; conteneur `Computers` vide | **Réussi** : GRP_Comptabilite 6, GRP_Developpement 8, GRP_Direction 3, GRP_Marketing 10, GRP_RH 3 ; `Computers` vide |
+| PS 05 | Première connexion d'un compte créé | Changement de mot de passe imposé | **Réussi** : `camille.lefebvre` doit changer son mot de passe sur le poste Marketing |
+
+**Total dans `Site_Paris` : 38 comptes.** Les 30 du CSV, plus 8 comptes créés manuellement avant le script, qui ne sont pas gérés par lui. Le compte `mamadoud`, déjà présent, a été reconnu par son prénom et son nom : le script n'a pas créé de doublon. Il a ensuite été rangé dans `Direction\users` et ajouté à `GRP_Direction`. Le serveur de fichiers `FILESERVER` a été placé dans une OU `Serveurs` dédiée : un serveur ne reçoit pas les mêmes GPO qu'un poste de travail.
+
+![Simulation : OU, groupes et utilisateurs](docs/images/tests/16-ps01-whatif-ou-groupes-utilisateurs.png)
+
+![Exécution réelle : bilan](docs/images/tests/19-ps02-execution-postes-bilan.png)
+
+![Relance : tout est ignoré](docs/images/tests/23-ps03-relance-tout-ignore.png)
+
+![Contrôle : groupes et conteneur Computers vide](docs/images/tests/24-ps04-controle-groupes-computers-vide.png)
+
+![Console AD : Developpement\users](docs/images/tests/20-console-ad-developpement-users.png)
+
+![Changement de mot de passe imposé à la première connexion](docs/images/tests/22-changement-mdp-camille-lefebvre.png)
+
+Journal complet de l'exécution réelle : [`docs/journaux/creation-ad-20261025-160936.log`](docs/journaux/creation-ad-20261025-160936.log). Il ne contient aucun mot de passe.
+
+## Partages de fichiers par service
+
+Un partage unique `\\FILESERVER\Partages` (dossier `E:\Partages`, sur un disque de données dédié) contient un dossier par service et un dossier `Commun`. Les droits suivent le modèle **AGDLP** : les utilisateurs sont dans le groupe global de leur service (`GRP_Marketing`), ce groupe est membre d'un groupe domaine local (`DL_partage_Marketing_RW`), et seul ce dernier reçoit le droit NTFS **Modification** sur le dossier. L'**énumération basée sur l'accès** (ABE) masque à chacun les dossiers qu'il ne peut pas ouvrir.
+
+| Couche | Réglage |
+|---|---|
+| Partage SMB | Admins du domaine : Total ; Utilisateurs authentifiés : Modifier ; ABE activée |
+| NTFS sur `E:\Partages` | Héritage coupé ; Administrateurs et Système : Contrôle total ; Utilisateurs authentifiés : Lecture sur la racine seulement |
+| NTFS sur chaque dossier | `DL_partage_<Service>_RW` : Modification |
+
+| ID | Test | Résultat obtenu |
+|---|---|---|
+| PART 01 | Port SMB 445 joignable depuis le poste Marketing | **Réussi** |
+| PART 02 | Camille (Marketing) ne voit que Commun et Marketing | **Réussi** |
+| PART 03 à 06 | Écriture, accès refusé à Direction, groupes du jeton, test avec un compte Direction | À capturer |
+| PART 07 | ABE active sur le partage | **Réussi** |
+| PART 08 | Un administrateur du domaine voit les 6 dossiers | **Réussi** |
+
+![Droits NTFS du dossier Marketing](docs/images/tests/25-ntfs-droits-marketing.png)
+
+![Partage SMB, droits de partage et ABE](docs/images/tests/26-partage-smb-abe.png)
+
+![Camille ne voit que Commun et Marketing](docs/images/tests/28-part02-abe-camille-commun-marketing.png)
+
+![Un administrateur du domaine voit les 6 dossiers](docs/images/tests/30-admin-voit-tous-les-dossiers.png)
 
 ## Problèmes rencontrés et solutions
 
-### 1. Les deux pare-feu se déclaraient maîtres (split-brain CARP)
+### 1. Aucune communication avec les nouvelles zones : « Block private networks »
 
-**Symptôme** : une fois la haute disponibilité configurée, pfSense 1 et pfSense 2 affichaient tous les deux le statut MASTER pour la passerelle virtuelle 192.168.99.100, et le trafic du LAN ne sortait plus.
+**Symptôme** : après la création de la DMZ, les machines de la zone ne communiquaient pas à travers pfSense.
 
-**Cause** : avec CARP, le nœud de secours ne reste BACKUP que s'il reçoit les annonces du maître. Ici, chaque nœud ne recevait pas les annonces de l'autre et se proclamait maître. Deux équipements répondaient alors pour la même adresse 192.168.99.100, et le trafic ne pouvait plus sortir correctement.
+**Cause** : l'option *Block private networks and loopback addresses* était cochée sur l'interface. Elle bloque toute source en adresse privée (RFC 1918). Elle est prévue pour une interface WAN face à Internet, d'où aucune adresse privée ne doit arriver ; sur une zone interne, dont les adresses sont elles-mêmes privées, elle bloque tout.
 
-**Résolution** : reprise de la configuration CARP sur les deux nœuds, en s'appuyant sur la documentation officielle de pfSense et sur des forums décrivant le même cas, jusqu'à obtenir un seul maître et un nœud de secours en BACKUP.
+**Résolution** : après plusieurs vérifications et tentatives, identification de l'option en cause dans la configuration de l'interface, puis décochage. Le WAN du lab (192.168.112.0/24, derrière le NAT VMware) étant lui aussi privé, l'option y est également désactivée.
 
-**Résultat** : un seul maître à la fois ; quand pfSense 1 est arrêté, pfSense 2 assure seul la sortie Internet (test HA 01).
+**Ce que j'en retiens** : une option de sécurité se comprend avant de se cocher ; son libellé précise d'ailleurs qu'elle ne convient pas à une interface en adressage privé.
 
-### 2. Pas de sortie Internet depuis le LAN
+### 2. La DMZ pouvait joindre le contrôleur de domaine : règles placées sur la mauvaise interface
 
-**Symptôme** : les machines du LAN n'accédaient pas à Internet.
+**Symptôme** : l'objectif était d'interdire la DMZ vers le LAN, pourtant `nc` depuis le serveur web joignait 192.168.99.15 sur les ports 445 (SMB) et 389 (LDAP).
 
-**Cause** : la règle de pare-feu autorisant la sortie sur l'interface LAN de pfSense était mal définie.
+**Cause** : deux erreurs de conception.
+- Une règle « Pass TCP/UDP serveur DMZ vers toute destination, tous ports », prévue pour la sortie Internet, autorisait aussi tous les réseaux internes.
+- Des règles « source LAN » ou « source SYNC » avaient été créées dans les onglets DMZ et FILESERVER. pfSense applique une règle sur l'interface par laquelle le trafic **entre** : ces règles ne pouvaient jamais correspondre.
 
-**Résolution** : correction de la règle de sortie, en conservant le blocage de la plage 192.168.99.110 à .120, qui doit rester joignable en interne sans sortir sur Internet.
+**Résolution** : création des alias `RESEAUX_PRIVES`, `PORTS_WEB` et `PORTS_AD`, puis réécriture des onglets DMZ et FILESERVER selon le schéma : exceptions précises en haut, blocage journalisé vers tous les réseaux privés, puis sortie Internet limitée au web.
 
-**Résultat** : sortie autorisée pour le LAN et bloquée pour la plage réservée (tests NET 02 et NET 03).
+**Résultat** : FileServer ne joint plus la DMZ (SEG 03) mais conserve ses accès AD (SEG 04, SEG 05).
 
-### 3. Une machine hôte de 16 Go de RAM pour 11 VM
+**Ce que j'en retiens** : sur un pare-feu, une règle se lit depuis l'interface d'entrée ; une règle qui ne voit jamais de trafic (compteur d'états à 0) est un signal d'alerte.
 
-**Problème** : avec 16 Go de RAM, le PC hôte ne peut pas faire tourner les 11 machines virtuelles en même temps.
+### 3. Plus de résolution DNS dans la DMZ après le durcissement
 
-**Résolution** : pour chaque scénario de test, seules les VM nécessaires sont démarrées. Le test HA 01, par exemple, a été réalisé avec pfSense 2, Windows Server 2019, Ubuntu Client et un poste Windows.
+**Symptôme** : `ping 8.8.8.8` répondait, mais `curl` échouait avec « Could not resolve host ».
 
-**Résultat** : tous les tests ont pu être menés malgré les ressources limitées.
+**Cause** : la règle DNS avait pour destination « DMZ address », qui désigne l'adresse propre de l'interface (192.168.20.2), pas la VIP 192.168.20.5 utilisée comme DNS par le serveur. La requête descendait jusqu'au blocage vers `RESEAUX_PRIVES`.
 
-### 4. Une passerelle WAN mal documentée
+**Résolution** : destination de la règle DNS remplacée par « This Firewall (self) », qui englobe toutes les adresses de pfSense, VIP comprises.
 
-**Symptôme** : la première version du dossier présentait 192.168.112.99 comme la passerelle Internet amont des deux pare-feu.
+**Résultat** : résolution et sortie HTTPS fonctionnelles (SEG 02).
 
-**Cause** : en relisant le statut CARP, 192.168.112.99 apparaît comme la VIP CARP WAN (VHID 1), une adresse portée par la paire pfSense elle-même, donc pas sa passerelle.
+### 4. Un serveur que l'on croyait dans le domaine
 
-**Résolution** : relevé de la vraie passerelle dans System > Routing > Gateways : 192.168.112.2, la passerelle du NAT VMware. Correction du plan d'adressage, des procédures et des schémas.
+**Symptôme** : `gpupdate /force` se terminait sans erreur sur Windows Server 2025, ce qui laissait croire qu'il était membre du domaine.
 
-**Ce que j'en retiens** : une documentation se vérifie sur l'équipement, pas de mémoire.
+**Cause** : sur une machine en groupe de travail, `gpupdate` applique simplement la stratégie locale. `Test-ComputerSecureChannel` indiquait en réalité que l'ordinateur ne faisait partie d'aucun domaine.
 
-### 5. Synchronisation des états pfsync inopérante
+**Résolution** : jonction au domaine `ecole-gn.gn`, réalisée à travers le pare-feu avec les seuls ports de l'alias `PORTS_AD`.
 
-**Symptôme** : dans Status > CARP, chaque nœud n'affichait que son propre identifiant d'états (6a813fb7 sur pfSense 1, 3280341d sur pfSense 2). pfSense indique que les deux identifiants doivent apparaître sur chaque nœud quand pfsync fonctionne.
+**Résultat** : `Test-ComputerSecureChannel` renvoie True (SEG 05).
 
-**Impact** : CARP basculait bien la VIP, mais le nœud de secours ne connaissait pas les connexions en cours. Un ping repart, une session TCP (SSH, RDP, téléchargement) aurait été coupée à la bascule.
+**Ce que j'en retiens** : on vérifie un état avec la commande qui le mesure, pas avec une commande qui réussit dans les deux cas.
 
-**Diagnostic** :
-1. Ajout d'une règle autorisant tout le trafic sur l'interface SYNC : nécessaire, mais le défaut persiste.
-2. Vérification de System > High Avail Sync : le champ **pfsync Synchronize Peer IP** contenait **192.168.99.1**, l'adresse LAN de pfSense 1. Les états partaient vers une adresse hors du réseau de synchronisation.
+### 5. Le durcissement a cassé la supervision du serveur web
 
-**Résolution** : adresse du pair placée sur le réseau SYNC (10.1.10.3 sur pfSense 1, 10.1.10.2 sur pfSense 2) ; synchronisation de configuration XMLRPC configurée uniquement sur le maître.
+**Symptôme** : juste après la mise en place du blocage DMZ vers les réseaux privés, les journaux pfSense montraient des tentatives répétées de 192.168.20.1 vers 192.168.99.30:10051, bloquées par la nouvelle règle.
 
-**Résultat** : chaque nœud affiche les deux identifiants, les tables d'états sont partagées (test HA 04).
+**Cause** : l'agent Zabbix du serveur web fonctionne en mode actif ; il contacte lui-même le serveur Zabbix du LAN sur le port 10051. Ce flux légitime n'avait pas été prévu dans la matrice des flux.
 
-![pfsync fonctionnel sur pfSense 1](docs/images/tests/20-pfsync-ok-pfsense1.png)
+**Résolution** :
+1. Ajout d'une exception précise au-dessus du blocage : DMZ vers 192.168.99.30, TCP 10051 uniquement.
+2. Première version de la règle saisie avec la destination 192.168.99.20 (le poste Marketing) : son compteur d'états restait à 0, signe qu'elle ne servait jamais. Destination corrigée en 192.168.99.30.
+3. Mise à jour de l'adresse de l'hôte dans Zabbix (192.168.20.1 au lieu de l'ancienne adresse du LAN).
 
-**Ce que j'en retiens** : quand CARP bascule correctement, cela ne prouve pas que pfsync fonctionne ; les deux se vérifient séparément.
+**Résultat** : l'hôte Ubuntu_web_prod est de nouveau supervisé, ZBX au vert (SEG 07). Le mode passif (LAN vers DMZ, port 10050) passe par la règle LAN existante.
 
-### 6. Les connexions n'auraient pas survécu à une bascule : NAT sortante sur l'adresse d'interface
+![Journaux : agent Zabbix bloqué](docs/images/tests/08-journaux-zabbix-10051-bloque.png)
 
-**Symptôme** : même avec pfsync fonctionnel, une connexion TCP en cours risquait d'être coupée lors d'une bascule.
+![Zabbix : serveur web en DMZ supervisé](docs/images/tests/11-zabbix-serveur-web-dmz-vert.png)
 
-**Cause** : la règle de NAT sortante traduisait vers « WAN address », l'adresse propre de chaque nœud (192.168.112.138 sur pfSense 1, 192.168.112.139 sur pfSense 2). À la bascule, l'adresse de sortie changeait : pour le serveur distant, une autre machine reprenait la conversation, et il ne la reconnaissait pas.
+**Ce que j'en retiens** : un durcissement se teste aussi sur ce qu'il ne doit pas casser. Journaliser les blocages permet de retrouver les flux légitimes oubliés.
 
-**Résolution** : mode Hybrid Outbound NAT et règle traduisant les sous-réseaux LAN vers la VIP WAN **192.168.112.99**, commune aux deux nœuds.
+### 6. Une étendue DHCP sans passerelle et avec un DNS public
 
-**Résultat** : un téléchargement en cours continue sans interruption quand pfSense 1 s'arrête (test HA 05).
+**Symptôme** : le poste Marketing obtenait bien une adresse (192.168.99.55), mais `ipconfig /all` affichait une passerelle vide et deux serveurs DNS, 192.168.99.15 et 8.8.8.8.
 
-![NAT sortante vers la VIP WAN](docs/images/tests/26-nat-sortante-apres-vip-wan.png)
+**Cause** : l'option 003 (Routeur) n'était pas définie dans l'étendue, et l'option 006 contenait un DNS public en plus du contrôleur de domaine.
 
-**Ce que j'en retiens** : une haute disponibilité complète repose sur trois briques distinctes : CARP pour l'adresse, pfsync pour les états, une NAT sortante sur la VIP pour l'adresse de sortie.
+**Impact** : sans passerelle, le poste ne peut joindre ni Internet, ni la DMZ, ni FileServer. Avec 8.8.8.8, qui ne connaît pas `ecole-gn.gn`, l'ouverture de session et les GPO peuvent échouer de façon aléatoire.
 
-## Évolutions prévues
+**Résolution** : option 003 réglée sur la VIP 192.168.99.100, option 006 limitée à 192.168.99.15. Les requêtes vers Internet sont transmises par le serveur DNS de l'AD (redirecteurs), jamais par les postes eux-mêmes.
 
-- WAN des deux nœuds en adresse fixe plutôt qu'en DHCP
-- Segmentation en VLAN (serveurs, utilisateurs, administration, DMZ pour le serveur web)
-- Second contrôleur de domaine et DNS
-- Sauvegarde des VM et des configurations, avec test de restauration (RPO et RTO mesurés)
-- Supervision du serveur Windows par Zabbix
+```powershell
+Set-DhcpServerv4OptionValue -ScopeId 192.168.99.0 -Router 192.168.99.100 -DnsServer 192.168.99.15 -DnsDomain ecole-gn.gn
+```
 
-## Documentation
+![Avant : passerelle vide, DNS public](docs/images/tests/12-dhcp-avant-sans-passerelle.png)
 
-- [Dossier d'architecture technique complet](docs/dossier-architecture.md)
+![Après : passerelle VIP, DNS de l'AD seul](docs/images/tests/13-dhcp-apres-passerelle-dns-ad.png)
+
+**Ce que j'en retiens** : un bail obtenu ne prouve pas qu'un poste fonctionne ; on contrôle la passerelle et le DNS reçus.
+
+### 7. « Access is denied » en déplaçant une OU
+
+**Symptôme** : impossible de déplacer l'OU Comptabilite dans la nouvelle OU parente, même avec le compte administrateur du domaine.
+
+**Cause** : l'option *Protéger l'objet contre une suppression accidentelle*, cochée par défaut, ajoute une règle de refus « Tout le monde : supprimer ». Pour Active Directory, déplacer un objet revient à le retirer de son emplacement d'origine. Or un refus l'emporte toujours sur une autorisation, y compris pour l'administrateur.
+
+**Résolution** : affichage des fonctionnalités avancées, protection décochée le temps du déplacement, puis remise en place. En PowerShell : `Set-ADOrganizationalUnit -ProtectedFromAccidentalDeletion $false`, puis `Move-ADObject`.
+
+**Ce que j'en retiens** : cette protection évite qu'un glisser-déposer maladroit déplace ou supprime une OU entière. On la retire volontairement, pour une opération précise, puis on la remet.
+
+### 8. Partage du PC hôte refusé : accès invité bloqué
+
+**Symptôme** : depuis les VM, le montage du dossier d'échange du PC hôte échouait avec « *your organization's security policies block unauthenticated guest access* », puis avec les erreurs 86 et 67.
+
+**Cause** : le compte du domaine utilisé dans la VM n'existe pas sur le PC hôte, qui n'est pas membre du domaine. Windows retombait donc sur une connexion invité, sans authentification, que Windows 10 et Windows Server 2019 bloquent par défaut : un partage sans authentification permet à n'importe quelle machine de se faire passer pour un serveur de fichiers.
+
+**Résolution** : connexion avec un compte local du PC hôte, `net use Z: \\HOTE\partage /user:HOTE\compte *`, plutôt que de réactiver l'accès invité. Au passage, un partage non voulu de tout le dossier `C:\Users` de l'hôte a été repéré avec `net share`.
+
+**Ce que j'en retiens** : chaque code d'erreur indique l'étape qui échoue (86 : mot de passe ; 67 : nom de partage ; 1272 : invité bloqué). On ne contourne pas une protection de sécurité, on fournit la bonne authentification.
+
+### 9. `icacls : Paramètre non valide` : deux commandes sur une seule ligne
+
+**Symptôme** : la boucle d'attribution des droits NTFS renvoyait, pour chaque dossier, `icacls : Paramètre non valide « icacle »`.
+
+**Cause** : trois erreurs de saisie dans la même ligne. Il manquait le `$` devant la variable du chemin (`"$racine\d"`). Les deux commandes `icacls` n'étaient séparées par rien, PowerShell les lisait donc comme une seule commande. Enfin, la seconde était mal orthographiée (`icacle`).
+
+**Résolution** : le message d'erreur indiquait le paramètre refusé ; la comparaison avec la commande de référence a permis de corriger le chemin et l'orthographe, et d'ajouter un `;` entre les deux commandes. Aucun droit n'avait été modifié, car `icacls` refuse la ligne entière dès l'analyse des paramètres.
+
+**Ce que j'en retiens** : on lit le message d'erreur avant tout. Il nomme le paramètre fautif et indique où chercher.
+
+### 10. Un premier partage en double, créé depuis l'interface graphique
+
+**Symptôme** : `\\FILESERVER` affichait deux partages, `Partage` et `Partages`.
+
+**Cause** : un premier partage `Partage` avait été créé depuis l'interface graphique, avant la mise en place du partage scripté. Un partage oublié contourne l'organisation des droits, en particulier s'il expose la racine d'un disque.
+
+**Résolution** : contrôle du chemin exposé avec `Get-SmbShare`, puis suppression du partage, sans toucher aux fichiers, avec `Remove-SmbShare -Name "Partage" -Force`.
+
+![Deux partages : Partage et Partages](docs/images/tests/29-deux-partages-partage-et-partages.png)
+
+**Ce que j'en retiens** : `Get-SmbShare` fait partie des contrôles réguliers d'un serveur de fichiers. Un partage qui n'est pas documenté doit être justifié ou supprimé.
+
+## Bonnes pratiques appliquées
+
+- Le fichier netplan du serveur DMZ s'appelle `50-cloud-init.yaml` : la configuration réseau de cloud-init est désactivée (`/etc/cloud/cloud.cfg.d/99-disable-network-config.cfg`) pour qu'il ne soit pas réécrit au redémarrage.
+- Sauvegarde de la configuration pfSense avant chaque modification des règles.
+- Chaque règle porte une description ; une règle dont le compteur d'états reste à 0 est vérifiée.
+- Mémoire de l'hôte limitée (16 Go) : seules les VM utiles à chaque scénario sont démarrées.
+
+## Suite du projet
+
+- [x] Segmentation en trois zones et règles inter-zones
+- [x] Windows Server 2025 joint au domaine
+- [x] DHCP sur le contrôleur de domaine pour le LAN
+- [x] Partages par service sur Windows Server 2025 (AGDLP, NTFS, ABE ; tests PART 03 à 06 à compléter)
+- [x] Structure Site_Paris : une OU par service (users, computers), OU Admin pour les comptes d'administration
+- [x] Script PowerShell : 30 utilisateurs, 5 groupes et rangement des postes depuis deux CSV (exécuté et validé)
+- [x] OU Serveurs pour FILESERVER, conteneur Computers vidé
+- [ ] GPO : fond d'écran, lecteur réseau, politique de mots de passe
+- [ ] Script PowerShell : rapport des comptes inactifs et de l'espace disque
 
 ## Auteur
 
